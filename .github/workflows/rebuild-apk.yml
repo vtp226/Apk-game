@@ -8,6 +8,12 @@ on:
 jobs:
   rebuild:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ["28", "34"]
+    env:
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
 
@@ -20,22 +26,35 @@ jobs:
         run: |
           curl -L -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
 
+      - name: Inspect original APK
+        run: |
+          echo "=== native libs ==="
+          unzip -l input/game.apk | grep -E "lib/.*\.so" || echo "no native libs"
+          echo "=== dex/assets ==="
+          unzip -l input/game.apk | grep -E "classes.*dex|assets/bin|libunity|libmono" || true
+
       - name: Decode
         run: java -jar apktool.jar d -f input/game.apk -o work
+
+      - name: Show manifest info
+        run: |
+          grep -A6 "sdkInfo" work/apktool.yml || true
+          grep -E "uses-permission|<application|<uses-sdk" work/AndroidManifest.xml || true
 
       - name: Patch targetSdk, exported, resources.arsc
         run: |
           cat > patch.py <<'PY'
-          import re
+          import re, os
+          T = os.environ['TARGET']
           import xml.etree.ElementTree as ET
 
           # 1) targetSdk + minSdk
           p = "work/apktool.yml"
           t = open(p, encoding="utf-8").read()
           if "targetSdkVersion" in t:
-              t = re.sub(r"targetSdkVersion:.*", "targetSdkVersion: '34'", t)
+              t = re.sub(r"targetSdkVersion:.*", "targetSdkVersion: '" + T + "'", t)
           else:
-              t = re.sub(r"sdkInfo:\n", "sdkInfo:\n  targetSdkVersion: '34'\n", t) if "sdkInfo:" in t else t + "\nsdkInfo:\n  targetSdkVersion: '34'\n"
+              t = re.sub(r"sdkInfo:\n", "sdkInfo:\n  targetSdkVersion: '" + T + "'\n", t) if "sdkInfo:" in t else t + "\nsdkInfo:\n  targetSdkVersion: '" + T + "'\n"
           t = re.sub(r"minSdkVersion: '(\d+)'", lambda m: "minSdkVersion: '21'" if int(m.group(1)) < 21 else m.group(0), t)
           # 2) resources.arsc must be stored uncompressed for targetSdk 30+
           if "doNotCompress:" in t:
@@ -68,10 +87,10 @@ jobs:
           keytool -genkeypair -keystore my.jks -storepass android -keypass android \
             -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Game"
           "$BT/apksigner" sign --ks my.jks --ks-pass pass:android --key-pass pass:android \
-            --out game-new.apk aligned.apk
-          "$BT/apksigner" verify game-new.apk
+            --out game-t${{ matrix.target }}.apk aligned.apk
+          "$BT/apksigner" verify game-t${{ matrix.target }}.apk
 
       - uses: actions/upload-artifact@v4
         with:
-          name: game-new
-          path: game-new.apk
+          name: game-t${{ matrix.target }}
+          path: game-t${{ matrix.target }}.apk
