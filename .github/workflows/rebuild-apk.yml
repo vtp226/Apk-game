@@ -1,0 +1,77 @@
+name: Rebuild old APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ["input/game.apk"]
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Get apktool
+        run: |
+          curl -L -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+
+      - name: Decode
+        run: java -jar apktool.jar d -f input/game.apk -o work
+
+      - name: Patch targetSdk, exported, resources.arsc
+        run: |
+          cat > patch.py <<'PY'
+          import re
+          import xml.etree.ElementTree as ET
+
+          # 1) targetSdk + minSdk
+          p = "work/apktool.yml"
+          t = open(p, encoding="utf-8").read()
+          if "targetSdkVersion" in t:
+              t = re.sub(r"targetSdkVersion:.*", "targetSdkVersion: '34'", t)
+          else:
+              t = re.sub(r"sdkInfo:\n", "sdkInfo:\n  targetSdkVersion: '34'\n", t) if "sdkInfo:" in t else t + "\nsdkInfo:\n  targetSdkVersion: '34'\n"
+          t = re.sub(r"minSdkVersion: '(\d+)'", lambda m: "minSdkVersion: '21'" if int(m.group(1)) < 21 else m.group(0), t)
+          # 2) resources.arsc must be stored uncompressed for targetSdk 30+
+          if "doNotCompress:" in t:
+              if "- resources.arsc" not in t:
+                  t = t.replace("doNotCompress:\n", "doNotCompress:\n- resources.arsc\n", 1)
+          else:
+              t += "\ndoNotCompress:\n- resources.arsc\n"
+          open(p, "w", encoding="utf-8").write(t)
+
+          # 3) android:exported is mandatory for targetSdk 31+ on components with intent-filter
+          A = "http://schemas.android.com/apk/res/android"
+          ET.register_namespace("android", A)
+          mp = "work/AndroidManifest.xml"
+          tree = ET.parse(mp)
+          for tag in ("activity", "activity-alias", "service", "receiver"):
+              for el in tree.getroot().iter(tag):
+                  if el.find("intent-filter") is not None and "{%s}exported" % A not in el.attrib:
+                      el.set("{%s}exported" % A, "true")
+          tree.write(mp, encoding="utf-8", xml_declaration=True)
+          PY
+          python3 patch.py
+
+      - name: Build
+        run: java -jar apktool.jar b work -o unsigned.apk
+
+      - name: Align and sign
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$BT/zipalign" -p -f 4 unsigned.apk aligned.apk
+          keytool -genkeypair -keystore my.jks -storepass android -keypass android \
+            -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Game"
+          "$BT/apksigner" sign --ks my.jks --ks-pass pass:android --key-pass pass:android \
+            --out game-new.apk aligned.apk
+          "$BT/apksigner" verify game-new.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: game-new
+          path: game-new.apk
